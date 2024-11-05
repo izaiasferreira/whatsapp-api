@@ -67,7 +67,7 @@ import makeWASocket, {
   WAMessageUpdate,
   WASocket,
   WAVersion,
-} from '@whiskeysockets/baileys/';
+} from '@whiskeysockets/baileys';
 import {
   ConfigService,
   ConfigSessionPhone,
@@ -78,8 +78,7 @@ import {
 } from '../../config/env.config';
 import { Logger } from '../../config/logger.config';
 import { INSTANCE_DIR, ROOT_DIR } from '../../config/path.config';
-import { lstat, readFileSync } from 'fs';
-import { join } from 'path';
+import { join, normalize } from 'path';
 import axios, { AxiosError } from 'axios';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
@@ -89,6 +88,7 @@ import { release } from 'os';
 import P from 'pino';
 import {
   AudioMessageFileDto,
+  Button,
   ContactMessage,
   MediaFileDto,
   MediaMessage,
@@ -96,6 +96,7 @@ import {
   SendAudioDto,
   SendButtonsDto,
   SendContactDto,
+  SendLinkDto,
   SendListDto,
   SendListLegacyDto,
   SendLocationDto,
@@ -133,11 +134,21 @@ import { WebhookEvents, WebhookEventsEnum, WebhookEventsType } from '../dto/webh
 import { Query, Repository } from '../../repository/repository.service';
 import PrismType from '@prisma/client';
 import * as s3Service from '../../integrations/minio/minio.utils';
-import { TypebotSessionService } from '../../integrations/typebot/typebot.service';
 import { ProviderFiles } from '../../provider/sessions';
 import { Websocket } from '../../websocket/server';
 import { ulid } from 'ulid';
 import { isValidUlid } from '../../validate/ulid';
+import sharp from 'sharp';
+import ffmpeg from 'fluent-ffmpeg';
+import { PassThrough, Stream } from 'stream';
+import {
+  accessSync,
+  constants,
+  existsSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
 
 type InstanceQrCode = {
   count: number;
@@ -171,10 +182,6 @@ export class WAStartupService {
   private readonly userDevicesCache: CacheStore = new NodeCache();
   private readonly instanceQr: InstanceQrCode = { count: 0 };
   private readonly stateConnection: InstanceStateConnection = { state: 'close' };
-  private readonly typebotSession = new TypebotSessionService(
-    this.repository,
-    this.configService,
-  );
   private readonly databaseOptions: Database =
     this.configService.get<Database>('DATABASE');
 
@@ -818,7 +825,7 @@ export class WAStartupService {
           isGroup: isJidGroup(received.key.remoteJid),
         } as PrismType.Message;
 
-        if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE && type === 'notify') {
+        if (this.databaseOptions.DB_OPTIONS.NEW_MESSAGE) {
           const { id } = await this.repository.message.create({ data: messageRaw });
           messageRaw.id = id;
         }
@@ -890,92 +897,6 @@ export class WAStartupService {
             });
           }
         }
-
-        this.typebotSession.onMessage(messageRaw, async (items) => {
-          for await (const item of items) {
-            if (item?.text) {
-              await this.textMessage({
-                number: messageRaw.keyRemoteJid,
-                textMessage: { text: item.text },
-                options: { delay: 1200, presence: 'composing' },
-              });
-              continue;
-            }
-
-            if (item?.video || item?.embed) {
-              const url = item?.video || item?.embed;
-              const head = await (async () => {
-                try {
-                  return await axios.head(url);
-                } catch (error) {
-                  return {
-                    headers: {
-                      'content-type': 'text/html; charset=utf-8',
-                    },
-                  };
-                }
-              })();
-
-              const ext = mime.extension(head.headers['content-type']);
-              if (ext && ext.includes('html')) {
-                await this.textMessage({
-                  number: messageRaw.keyRemoteJid,
-                  textMessage: { text: url },
-                  options: { delay: 1200, presence: 'composing' },
-                });
-                continue;
-              }
-
-              await this.mediaMessage({
-                number: messageRaw.keyRemoteJid,
-                mediaMessage: {
-                  mediatype: 'document',
-                  media: url,
-                },
-                options: { delay: 1200, presence: 'composing' },
-              });
-              continue;
-            }
-
-            if (item?.image) {
-              await this.mediaMessage({
-                number: messageRaw.keyRemoteJid,
-                mediaMessage: {
-                  mediatype: 'image',
-                  fileName: 'image.jpg',
-                  media: item.image,
-                },
-                options: { delay: 1200, presence: 'composing' },
-              });
-              continue;
-            }
-
-            if (item?.audio) {
-              const head = await axios.head(item.audio);
-
-              if (head.headers['content-type'].includes('audio/ogg')) {
-                await this.audioWhatsapp({
-                  number: messageRaw.keyRemoteJid,
-                  audioMessage: {
-                    audio: item.audio,
-                  },
-                  options: { delay: 1200, presence: 'recording' },
-                });
-                continue;
-              }
-
-              await this.mediaMessage({
-                number: messageRaw.keyRemoteJid,
-                mediaMessage: {
-                  mediatype: 'audio',
-                  media: item.audio,
-                },
-                options: { delay: 1200, presence: 'composing' },
-              });
-              continue;
-            }
-          }
-        });
       }
     },
 
@@ -989,6 +910,10 @@ export class WAStartupService {
         5: 'PLAYED',
       };
       for await (const { key, update } of args) {
+        if (update.status === 4 && key?.remoteJid) {
+          key.remoteJid = key.remoteJid.replace(/:\d+(?=@)/, '');
+        }
+
         if (key.remoteJid !== 'status@broadcast' && !key?.remoteJid?.match(/(:\d+)/)) {
           const message = {
             ...key,
@@ -1401,14 +1326,182 @@ export class WAStartupService {
     );
   }
 
-  private async prepareMediaMessage(mediaMessage: MediaMessage & { mimetype?: string }) {
+  private async generateVideoThumbnailFromStream<T = string>(
+    video: T,
+    timeInSeconds = '0',
+  ): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const thumbnailStream = new PassThrough();
+      const chunks = [];
+
+      let input: PassThrough | T = video;
+
+      if (Buffer.isBuffer(video)) {
+        input = new PassThrough();
+        (input as PassThrough).end(video);
+      }
+
+      ffmpeg(input as any)
+        .inputOptions(['-ss', timeInSeconds])
+        .outputOptions('-frames:v 1')
+        .outputFormat('image2pipe')
+        .on('start', () => {
+          thumbnailStream.on('data', (chunk) => chunks.push(chunk));
+        })
+        .on('error', (err) => {
+          reject(new Error(`Error generating thumbnail: ${err.message}`));
+        })
+        .on('end', () => {
+          resolve(Buffer.concat(chunks));
+        })
+        .pipe(thumbnailStream, { end: true });
+    });
+  }
+
+  private async convertAudioToWH(
+    inputPath: string,
+    format: { input?: string; to?: string } = { input: 'mp3', to: 'aac' },
+  ) {
+    return new Promise<Buffer>((resolve, reject) => {
+      if (!existsSync(inputPath)) {
+        reject(new Error(`Input file not found: ${inputPath}`));
+        return;
+      }
+
+      try {
+        accessSync(inputPath, constants.R_OK);
+      } catch (error) {
+        reject(new Error(`No read permissions for file: ${inputPath}`));
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      const audioStream = new PassThrough();
+      const normalizedPath = normalize(inputPath);
+
+      const inputFormat =
+        format.input === 'mpga' || 'bin'
+          ? 'mp3'
+          : format.input === 'oga'
+            ? 'ogg'
+            : format.input;
+      const audioCodec = format.to === 'ogg' ? 'libvorbis' : 'aac';
+      const outputFormat = format.to === 'ogg' ? 'ogg' : 'adts';
+
+      const command = ffmpeg(normalizedPath)
+        .inputFormat(inputFormat)
+        .audioCodec(audioCodec)
+        .outputFormat(outputFormat);
+
+      command
+        .on('start', (commandLine) => {
+          console.log('FFmpeg started with command:', commandLine);
+          audioStream.on('data', (chunk) => chunks.push(chunk));
+        })
+        .on('error', (err, stdout, stderr) => {
+          console.error('FFmpeg error:', err.message);
+          console.error('FFmpeg stderr:', stderr);
+
+          ffmpeg(normalizedPath)
+            .inputFormat(inputFormat)
+            .outputFormat('wav')
+            .on('end', () => {
+              console.log('Converted to WAV, retrying final conversion...');
+              const intermediatePath = normalizedPath.replace(/\.[^/.]+$/, '.wav');
+              const secondCommand = ffmpeg(intermediatePath)
+                .audioCodec(audioCodec)
+                .outputFormat(outputFormat);
+
+              secondCommand
+                .on('error', (err2, stdout2, stderr2) => {
+                  console.error('Second FFmpeg error:', err2.message);
+                  reject(
+                    new Error(
+                      `Final conversion failed: ${err2.message}\nFFmpeg stderr: ${stderr2}`,
+                    ),
+                  );
+                })
+                .on('end', () => {
+                  console.log('Final conversion to target format successful');
+                  resolve(Buffer.concat(chunks));
+                })
+                .pipe(audioStream, { end: true });
+            })
+            .on('error', (err1) =>
+              reject(new Error(`WAV conversion failed: ${err1.message}`)),
+            )
+            .pipe(audioStream, { end: true });
+        })
+        .on('end', () => {
+          console.log('FFmpeg processing finished');
+          resolve(Buffer.concat(chunks));
+        })
+        .pipe(audioStream, { end: true });
+    });
+  }
+
+  private async prepareMediaMessage(
+    mediaMessage: MediaMessage & { mimetype?: string; convert?: boolean },
+  ) {
+    const uploadPath = join(ROOT_DIR, 'uploads');
+    let fileName = join(uploadPath, mediaMessage?.fileName || '');
+
     try {
+      let preview: Buffer;
+      let media: Buffer;
+      let mimetype = mediaMessage.mimetype;
+
+      let ext = mediaMessage.extension;
+
+      const isURL = /http(s?):\/\//.test(mediaMessage.media as string);
+
+      if (isURL) {
+        const response = await axios.get(mediaMessage.media as string, {
+          responseType: 'arraybuffer',
+        });
+
+        mimetype = response.headers['content-type'];
+        if (!ext) {
+          ext = mime.extension(mimetype) as string;
+        }
+
+        if (!mediaMessage?.fileName) {
+          fileName = join(uploadPath, ulid() + '.' + ext);
+        }
+
+        writeFileSync(fileName, Buffer.from(response.data));
+
+        if (mediaMessage.mediatype === 'image') {
+          preview = response.data;
+        }
+      }
+
+      if (mediaMessage.mediatype === 'video') {
+        try {
+          preview = await this.generateVideoThumbnailFromStream(fileName);
+        } catch (error) {
+          preview = readFileSync(join(ROOT_DIR, 'public', 'images', 'video-cover.png'));
+        }
+      }
+
+      const isAccOrOgg = /aac|ogg/.test(mediaMessage?.mimetype || mimetype);
+      if (mediaMessage.convert && isAccOrOgg) {
+        if (['ogg', 'oga'].includes(ext)) {
+          media = readFileSync(fileName);
+        } else {
+          media = await this.convertAudioToWH(fileName, {
+            input: ext as string,
+            to: 'ogg',
+          });
+        }
+      }
+
+      if (!media) {
+        media = readFileSync(fileName);
+      }
+
       const prepareMedia = await prepareWAMessageMedia(
-        {
-          [mediaMessage.mediatype]: isURL(mediaMessage.media as string)
-            ? { url: mediaMessage.media }
-            : (mediaMessage.media as Buffer),
-        } as any,
+        { [mediaMessage.mediatype]: media } as any,
         { upload: this.client.waUploadToServer },
       );
 
@@ -1420,31 +1513,30 @@ export class WAStartupService {
         mediaMessage.fileName = arrayMatch[1];
       }
 
-      let mimetype: string | boolean;
-
-      if (typeof mediaMessage.media === 'string' && isURL(mediaMessage.media)) {
-        mimetype = mime.lookup(mediaMessage.media);
-        if (!mimetype) {
-          const head = await axios.head(mediaMessage.media as string);
-          mimetype = head.headers['content-type'];
-        }
-      } else {
-        mimetype = mime.lookup(mediaMessage.fileName);
+      if (mediaMessage?.fileName) {
+        mimetype = mime.lookup(mediaMessage.fileName) as string;
       }
 
       prepareMedia[mediaType].caption = mediaMessage?.caption;
       prepareMedia[mediaType].mimetype = mediaMessage?.mimetype || mimetype;
       prepareMedia[mediaType].fileName = mediaMessage.fileName;
 
-      if (mediaMessage?.mimetype === 'audio/aac') {
+      if (isAccOrOgg) {
         prepareMedia.audioMessage.ptt = true;
       }
 
       if (mediaMessage.mediatype === 'video') {
-        prepareMedia[mediaType].jpegThumbnail = Uint8Array.from(
-          readFileSync(join(process.cwd(), 'public', 'images', 'video-cover.png')),
-        );
+        prepareMedia[mediaType].jpegThumbnail = preview;
         prepareMedia[mediaType].gifPlayback = false;
+      }
+
+      if (mediaMessage.mediatype === 'image') {
+        const p = await sharp(preview || media)
+          .resize(320, 240, { fit: 'contain' })
+          .toFormat('jpeg', { quality: 80 })
+          .toBuffer();
+
+        prepareMedia.imageMessage.jpegThumbnail = p;
       }
 
       return generateWAMessageFromContent(
@@ -1453,12 +1545,27 @@ export class WAStartupService {
         { userJid: this.instance.ownerJid },
       );
     } catch (error) {
+      const axiosError = error as AxiosError;
+      if (axiosError?.isAxiosError) {
+        this.logger.error(axiosError?.message);
+        const err = Buffer.from(axiosError?.response?.data as any).toString('utf-8');
+        throw new BadRequestException(axiosError?.message, err);
+      }
+
       this.logger.error(error);
+
       throw new InternalServerErrorException(error?.toString() || error);
+    } finally {
+      if (existsSync(fileName)) {
+        unlinkSync(fileName);
+      }
     }
   }
 
   public async mediaMessage(data: SendMediaDto) {
+    if (data.mediaMessage?.fileName) {
+      data.mediaMessage.extension = data.mediaMessage.fileName.split('.').pop();
+    }
     const generate = await this.prepareMediaMessage(data.mediaMessage);
 
     return await this.sendMessageWithTyping(
@@ -1468,12 +1575,14 @@ export class WAStartupService {
     );
   }
 
-  public async mediaFileMessage(data: MediaFileDto, file: Express.Multer.File) {
+  public async mediaFileMessage(data: MediaFileDto, fileName: string) {
+    const ext = fileName.split('.').pop();
     const generate = await this.prepareMediaMessage({
-      fileName: file.originalname,
-      media: file.buffer,
+      fileName: fileName,
+      media: fileName,
       mediatype: data.mediatype,
       caption: data?.caption,
+      extension: ext,
     });
 
     return await this.sendMessageWithTyping(
@@ -1491,6 +1600,7 @@ export class WAStartupService {
       media: data.audioMessage.audio,
       mimetype: 'audio/aac',
       mediatype: 'audio',
+      convert: data?.options?.convertAudio,
     });
 
     return this.sendMessageWithTyping(
@@ -1500,12 +1610,15 @@ export class WAStartupService {
     );
   }
 
-  public async audioWhatsAppFile(data: AudioMessageFileDto, file: Express.Multer.File) {
+  public async audioWhatsAppFile(data: AudioMessageFileDto, fileName: string) {
+    const ext = fileName.split('.').pop();
     const generate = await this.prepareMediaMessage({
-      fileName: file.originalname,
-      media: file.buffer,
+      fileName: fileName,
+      media: fileName,
       mediatype: 'audio',
       mimetype: 'audio/aac',
+      convert: data?.convertAudio as boolean,
+      extension: ext,
     });
 
     return this.sendMessageWithTyping(
@@ -1717,6 +1830,36 @@ export class WAStartupService {
     });
   }
 
+  public async linkMessage(data: SendLinkDto) {
+    return await this.sendMessageWithTyping(data.number, {
+      extendedTextMessage: {
+        text: (() => {
+          let t = data.linkMessage.link;
+          if (data.linkMessage?.text) {
+            t += '\n\n';
+            t += data.linkMessage.text;
+          }
+          return t;
+        })(),
+        canonicalUrl: data.linkMessage.link,
+        matchedText: data.linkMessage?.link,
+        previewType: proto.Message.ExtendedTextMessage.PreviewType.IMAGE,
+        title: data.linkMessage?.title || data.linkMessage?.link,
+        description: data.linkMessage?.description,
+        jpegThumbnail: await (async () => {
+          if (data.linkMessage?.thumbnailUrl) {
+            try {
+              const response = await axios.get(data.linkMessage.thumbnailUrl, {
+                responseType: 'arraybuffer',
+              });
+              return new Uint8Array(response.data);
+            } catch {}
+          }
+        })(),
+      },
+    });
+  }
+
   // Chat Controller
   public async whatsappNumber(data: WhatsAppNumberDto) {
     const onWhatsapp: OnWhatsAppDto[] = [];
@@ -1870,7 +2013,7 @@ export class WAStartupService {
                 },
               ],
             },
-          },
+          } as any,
           message.keyRemoteJid,
         );
       }
@@ -2112,6 +2255,21 @@ export class WAStartupService {
         'Failed to reject a call',
         error?.toString(),
       );
+    }
+  }
+
+  public async assertSessions(chats: string[]) {
+    if (!Array.isArray(chats) || chats.length === 0) {
+      throw new BadRequestException('Empty or invalid array');
+    }
+    try {
+      await this.client.assertSessions(
+        chats.map((c) => this.createJid(c)),
+        true,
+      );
+      return { message: 'Session asserted' };
+    } catch (error) {
+      throw new InternalServerErrorException('Error asserting session', error.toString());
     }
   }
 
