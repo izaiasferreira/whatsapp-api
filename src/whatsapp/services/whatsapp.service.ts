@@ -413,7 +413,7 @@ export class WAStartupService {
       qrcodeTerminal.generate(qr, { small: true }, (qrcode) =>
         this.logger.log(
           `\n{ instance: ${this.instance.name}, qrcodeCount: ${this.instanceQr.count} }\n` +
-            qrcode,
+          qrcode,
         ),
       );
     }
@@ -1923,7 +1923,7 @@ export class WAStartupService {
                 responseType: 'arraybuffer',
               });
               return new Uint8Array(response.data);
-            } catch {}
+            } catch { }
           }
         })(),
       },
@@ -1960,33 +1960,49 @@ export class WAStartupService {
     }
   }
 
-  // Chat Controller
   public async whatsappNumber(data: WhatsAppNumberDto) {
+    type WhatsAppClientResult = {
+      jid: string;
+      exists: unknown;
+      lid?: string;
+    };
+
     const onWhatsapp: OnWhatsAppDto[] = [];
+
     for await (const number of data.numbers) {
       const jid = this.createJid(number);
+
       if (isLidUser(jid)) {
-        onWhatsapp.push(new OnWhatsAppDto(jid, !!true, jid as string));
+        onWhatsapp.push(new OnWhatsAppDto(jid, true, jid as string));
+        continue;
       }
+
       if (isJidGroup(jid)) {
         const group = await this.findGroup({ groupJid: jid }, 'inner');
         onWhatsapp.push(new OnWhatsAppDto(group.id, !!group?.id, '', group?.subject));
-      } else if (jid.includes('@broadcast')) {
+        continue;
+      }
+
+      if (jid.includes('@broadcast')) {
         onWhatsapp.push(new OnWhatsAppDto(jid, true));
-      } else {
-        try {
-          const result = (await this.client.onWhatsApp(jid))[0];
-          onWhatsapp.push(
-            new OnWhatsAppDto(result?.jid, !!result?.exists, result?.lid as string),
-          );
-        } catch (error) {
-          onWhatsapp.push(new OnWhatsAppDto(number, false));
-        }
+        continue;
+      }
+
+      try {
+        const result = (await this.client.onWhatsApp(jid))[0] as WhatsAppClientResult;
+
+        onWhatsapp.push(
+          new OnWhatsAppDto(result?.jid, !!result?.exists, result?.lid),
+        );
+      } catch (error) {
+        onWhatsapp.push(new OnWhatsAppDto(number, false));
       }
     }
 
     return onWhatsapp;
   }
+
+
 
   /**
    * @deprecated
@@ -2159,15 +2175,15 @@ export class WAStartupService {
     try {
       const msg: proto.IWebMessageInfo = m?.content
         ? {
-            key: {
-              id: m.keyId,
-              fromMe: m.keyFromMe,
-              remoteJid: m.keyRemoteJid,
-            },
-            message: {
-              [m.messageType]: m.content,
-            },
-          }
+          key: {
+            id: m.keyId,
+            fromMe: m.keyFromMe,
+            remoteJid: m.keyRemoteJid,
+          },
+          message: {
+            [m.messageType]: m.content,
+          },
+        }
         : ((await this.getMessage(m, true)) as proto.IWebMessageInfo);
 
       if (msg?.message?.documentWithCaptionMessage) {

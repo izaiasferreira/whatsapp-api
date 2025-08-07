@@ -22,7 +22,7 @@
  * │                                                                              │
  * │ See the License for the specific language governing permissions and          │
  * │ limitations under the License.                                               │
- * │                                                                              │
+ * │                                                                               │
  * │ @class                                                                       │
  * │ @constructs OnWhatsAppDto                                                    │
  * │ @param {String} jid @param {Boolean} exists @param {String} name             │
