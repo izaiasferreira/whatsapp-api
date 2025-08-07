@@ -7,7 +7,7 @@ networks:
 services:
   api:
     container_name: codechat_api
-    image: codechat/api:develop
+    image: codechat/api:v1.3.4
     restart: unless-stopped
     ports:
       - 8084:8084
@@ -36,10 +36,12 @@ services:
       - CONFIG_SESSION_PHONE_CLIENT=CodeChat_V1
       - CONFIG_SESSION_PHONE_NAME=Edge
 
-      - WA_VERSION=[ 2, 3000, 1015901307 ]
+      - WA_VERSION=[ 2, 3000, 1023235404 ]
 
       - QRCODE_LIMIT=10
       - QRCODE_EXPIRATION_TIME=60
+      - QRCODE_LIGHT_COLOR='#ffffff'
+      - QRCODE_DARK_COLOR='#198754'
 
       - CONNECTION_TIMEOUT=300
 
@@ -69,4 +71,3 @@ volumes:
   instances_connecteds:
     external:
       name: instances_connecteds
-    driver: local

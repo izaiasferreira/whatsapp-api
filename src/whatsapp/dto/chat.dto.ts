@@ -43,6 +43,7 @@ export class OnWhatsAppDto {
   constructor(
     public readonly jid: string,
     public readonly exists: boolean,
+    public readonly lid?: string,
     public readonly name?: string,
   ) {}
 }
@@ -82,12 +83,19 @@ export class ArchiveChatDto {
   archive: boolean;
 }
 
-export class DeleteMessage {
+export class MessageId {
   id: string;
+}
+
+export class DeleteMessage extends MessageId {
   everyOne?: 'true' | 'false';
 }
 
 export class RejectCallDto {
   callId: string;
   callFrom: string;
+}
+
+export class EditMessage extends MessageId {
+  text: string;
 }
